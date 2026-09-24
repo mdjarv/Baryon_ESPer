@@ -102,6 +102,7 @@
 
 #include <Arduino.h>
 #include "mbedtls/aes.h"   // ESP32 ships with mbedTLS built-in; no extra library needed
+#include "esp_private/gpio.h"  // gpio_od_enable()
 
 // #define RAW_DUMP    // ← uncomment to trace every received byte as [raw] 0xXX
 
@@ -120,9 +121,14 @@
 
 #define BOOT_MODE   SERVICE_MODE    // ← Change this line to switch modes
 
+// Pause before each reply so the PSP has turned its half-duplex line around.
+// A genuine PSP-1000 battery answers ~4.5 ms after a request; replies that are
+// much later get talked over by the PSP's retry.
+#define REPLY_DELAY_MS  2
+
 // GPIO pin assignment for the PSP DATA bus connection
 #define PSP_RX_PIN  5   // ESP32-C3 UART1 RX — receives data FROM the PSP
-#define PSP_TX_PIN  4   // ESP32-C3 UART1 TX — sends data TO the PSP (via diode)
+#define PSP_TX_PIN  4   // ESP32-C3 UART1 TX — sends data TO the PSP (open-drain)
 
 // Serial number bytes sent in response to opcode 0x0C (PSP queries battery identity).
 // The PSP decodes the serial number to determine boot behavior (see mode comments above).
@@ -205,12 +211,12 @@ struct SecretEntry { uint8_t id; uint8_t secret[8]; };
 
 static const SecretEntry CHALLENGE1_SECRET[] = {
   {0x00,{0xD2,0x07,0x22,0x53,0xA4,0xF2,0x74,0x68}},
-  {0x01,{0xB3,0x7A,0x16,0xEF,0x55,0x7B,0xD0,0x89}},
-  {0x02,{0xA0,0x4E,0x32,0xBB,0xA7,0x13,0x9E,0x46}},
-  {0x03,{0xB0,0xB8,0x09,0x83,0x39,0x89,0xFA,0xE2}},
-  {0x04,{0xFE,0x7D,0x78,0x99,0xBF,0xEC,0x47,0xC5}},
-  {0x05,{0x30,0x6F,0x3A,0x03,0xD8,0x6C,0xBE,0xE4}},
-  {0x06,{0x84,0x22,0xDF,0xEA,0xE2,0x1B,0x63,0xC2}},
+  {0x01,{0xF5,0xD7,0xD4,0xB5,0x75,0xF0,0x8E,0x4E}},
+  {0x02,{0xB3,0x7A,0x16,0xEF,0x55,0x7B,0xD0,0x89}},
+  {0x03,{0xCC,0x69,0x95,0x81,0xFD,0x89,0x12,0x6C}},
+  {0x04,{0xA0,0x4E,0x32,0xBB,0xA7,0x13,0x9E,0x46}},
+  {0x05,{0x49,0x5E,0x03,0x47,0x94,0x93,0x1D,0x7B}},
+  {0x06,{0xB0,0xB8,0x09,0x83,0x39,0x89,0xFA,0xE2}},
   {0x08,{0xAD,0x40,0x43,0xB2,0x56,0xEB,0x45,0x8B}},
   {0x0A,{0xC2,0x37,0x7E,0x8A,0x74,0x09,0x6C,0x5F}},
   {0x0D,{0x58,0x1C,0x7F,0x19,0x44,0xF9,0x62,0x62}},
@@ -223,12 +229,12 @@ static const SecretEntry CHALLENGE1_SECRET[] = {
 #define CHALLENGE1_LEN (sizeof(CHALLENGE1_SECRET)/sizeof(CHALLENGE1_SECRET[0]))
 
 static const SecretEntry CHALLENGE2_SECRET[] = {
-  {0x00,{0xF5,0xD7,0xD4,0xB5,0x75,0xF0,0x8E,0x4E}},
-  {0x01,{0xCC,0x69,0x95,0x81,0xFD,0x89,0x12,0x6C}},
-  {0x02,{0x49,0x5E,0x03,0x47,0x94,0x93,0x1D,0x7B}},
-  {0x03,{0xF4,0xE0,0x43,0x13,0xAD,0x2E,0xB4,0xDB}},
-  {0x04,{0x86,0x5E,0x3E,0xEF,0x9D,0xFB,0xB1,0xFD}},
-  {0x05,{0xFF,0x72,0xBD,0x2B,0x83,0xB8,0x9D,0x2F}},
+  {0x00,{0xF4,0xE0,0x43,0x13,0xAD,0x2E,0xB4,0xDB}},
+  {0x01,{0xFE,0x7D,0x78,0x99,0xBF,0xEC,0x47,0xC5}},
+  {0x02,{0x86,0x5E,0x3E,0xEF,0x9D,0xFB,0xB1,0xFD}},
+  {0x03,{0x30,0x6F,0x3A,0x03,0xD8,0x6C,0xBE,0xE4}},
+  {0x04,{0xFF,0x72,0xBD,0x2B,0x83,0xB8,0x9D,0x2F}},
+  {0x05,{0x84,0x22,0xDF,0xEA,0xE2,0x1B,0x63,0xC2}},
   {0x06,{0x58,0xB9,0x5A,0xAE,0xF3,0x99,0xDB,0xD0}},
   {0x08,{0x67,0xC0,0x72,0x15,0xD9,0x6B,0x39,0xA1}},
   {0x0A,{0x09,0x3E,0xC5,0x19,0xAF,0x0F,0x50,0x2D}},
@@ -452,6 +458,22 @@ uint8_t calcChecksum(const uint8_t* data, int len) {
 //       practice since the sync-scan in readPacket() will realign).
 // ═══════════════════════════════════════════════════════════════
 
+// Log lines are buffered and only written to USB once the bus has been idle
+// for LOG_IDLE_MS, so USB latency never delays an answer to the PSP.
+#define LOG_IDLE_MS 20
+String g_rxLog, g_txLog, g_log;
+
+// Non-blocking: writes only what fits in the USB TX buffer right now and keeps
+// the rest for the next idle moment. A blocking print here made replies late.
+void flushLog() {
+  int room = Serial.availableForWrite();
+  if (room <= 0 || !g_log.length()) return;
+  int n = min((int)g_log.length(), room);
+  Serial.write((const uint8_t*)g_log.c_str(), n);
+  g_log.remove(0, n);
+  if (g_log.length() > 16384) g_log = "[log overflow]\n";   // host not reading
+}
+
 void drainEcho(int n) {
   Serial1.flush();                    // wait for TX shift register to empty
   int got = 0;
@@ -461,7 +483,21 @@ void drainEcho(int n) {
     if (millis() - t > 100) break;
   }
   if (got != n)
-    Serial.printf("[echo] wanted %d, got %d\n", n, got);
+    g_log += "[echo] wanted " + String(n) + ", got " + String(got) + "\n";
+}
+
+/*
+ * uartWrite — transmit bytes with ~1 extra bit time of idle between them.
+ * A PSP-1000 itself sends 8E1 frames back to back (measured: 571 us/byte), so
+ * this padding is not required there; it is kept as harmless margin for
+ * receivers that check a second stop bit.
+ */
+void uartWrite(const uint8_t* data, int len) {
+  for (int i = 0; i < len; i++) {
+    Serial1.write(data[i]);
+    Serial1.flush();            // wait until the byte has left the shift register
+    delayMicroseconds(60);      // 1 bit @ 19200 = 52 us
+  }
 }
 
 /*
@@ -471,11 +507,13 @@ void drainEcho(int n) {
  * Also prints a ">" trace line to the USB serial monitor for debugging.
  */
 void sendRaw(const uint8_t* data, int len) {
-  Serial.print("> ");
-  for (int i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
-  Serial.println();
-  Serial1.write(data, len);
+  delay(REPLY_DELAY_MS);
+  uartWrite(data, len);   // transmit before logging: USB prints can stall for ms
   drainEcho(len);
+  char tmp[4];
+  g_txLog += ">";
+  for (int i = 0; i < len; i++) { snprintf(tmp, sizeof(tmp), " %02X", data[i]); g_txLog += tmp; }
+  g_txLog += "\n";
 }
 
 /*
@@ -492,6 +530,7 @@ void sendRaw(const uint8_t* data, int len) {
  * where the payload changes per call (e.g., serial number, crypto results).
  */
 void sendPacket(const char* headerHex, const uint8_t* payload, int payloadLen) {
+  delay(REPLY_DELAY_MS);
   int hlen = strlen(headerHex) / 2;
   uint8_t hbuf[16];
   for (int i = 0; i < hlen; i++) {
@@ -503,15 +542,17 @@ void sendPacket(const char* headerHex, const uint8_t* payload, int payloadLen) {
   if (payload && payloadLen > 0) memcpy(csbuf + hlen, payload, payloadLen);
   uint8_t cs = calcChecksum(csbuf, hlen + payloadLen);
 
-  Serial.print("> ");
-  for (int i = 0; i < hlen; i++) Serial.printf("%02X ", hbuf[i]);
-  if (payload) for (int i = 0; i < payloadLen; i++) Serial.printf("%02X ", payload[i]);
-  Serial.printf("%02X\n", cs);
-
-  Serial1.write(hbuf, hlen);
-  if (payload && payloadLen > 0) Serial1.write(payload, payloadLen);
-  Serial1.write(cs);
+  uartWrite(hbuf, hlen);   // transmit before logging: USB prints can stall for ms
+  if (payload && payloadLen > 0) uartWrite(payload, payloadLen);
+  uartWrite(&cs, 1);
   drainEcho(hlen + payloadLen + 1);
+
+  char tmp[4];
+  g_txLog += ">";
+  for (int i = 0; i < hlen; i++) { snprintf(tmp, sizeof(tmp), " %02X", hbuf[i]); g_txLog += tmp; }
+  for (int i = 0; payload && i < payloadLen; i++) { snprintf(tmp, sizeof(tmp), " %02X", payload[i]); g_txLog += tmp; }
+  snprintf(tmp, sizeof(tmp), " %02X", cs); g_txLog += tmp;
+  g_txLog += "\n";
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -546,6 +587,7 @@ bool readPacket(uint8_t expectedHeader, uint8_t& opcode,
   auto waitByte = [&]() -> int {
     while (!Serial1.available()) {
       if (millis() - t > BYTE_TIMEOUT_MS) return -1;
+      if (millis() - t > LOG_IDLE_MS) flushLog();
     }
     t = millis();
     int b = Serial1.read();
@@ -563,7 +605,7 @@ bool readPacket(uint8_t expectedHeader, uint8_t& opcode,
     hdr = waitByte();
     if (hdr < 0) return false;          // timed out waiting for any byte at all
     if ((uint8_t)hdr == expectedHeader) break;
-    Serial.printf("[sync] skip %02X\n", (uint8_t)hdr);
+    char sk[20]; snprintf(sk, sizeof(sk), "[sync] skip %02X\n", (uint8_t)hdr); g_log += sk;
   }
 
   int len = waitByte(); if (len < 0) return false;
@@ -595,9 +637,10 @@ bool readPacket(uint8_t expectedHeader, uint8_t& opcode,
   waitByte(); // consume and discard the trailing checksum byte
 
   // Print the received packet to USB serial for monitoring
-  Serial.printf("< %02X %02X %02X", (uint8_t)hdr, (uint8_t)len, opcode);
-  for (int i = 0; i < mesgLen; i++) Serial.printf(" %02X", mesg[i]);
-  Serial.println();
+  char tmp[4];
+  g_rxLog = "<";
+  for (uint8_t b : {(uint8_t)hdr, (uint8_t)len, opcode}) { snprintf(tmp, sizeof(tmp), " %02X", b); g_rxLog += tmp; }
+  for (int i = 0; i < mesgLen; i++) { snprintf(tmp, sizeof(tmp), " %02X", mesg[i]); g_rxLog += tmp; }
 
   return true;
 }
@@ -628,9 +671,11 @@ void handleOpcode(uint8_t opcode, const uint8_t* mesg, int mesgLen) {
        * Exact byte meaning: [0xA5 header][0x05 length][0x06 response opcode]
        *   [0x10 0xC3 = full-charge capacity in internal ADC units]
        *   [0x06 = some status flag] [0x76 = checksum]
-       * This static value works for all PSP-1000/2000/3000 models.
        */
-      static const uint8_t r[] = {0xA5,0x05,0x06,0x10,0xC3,0x06,0x76};
+      // Byte-for-byte copy of a genuine Sony PSP-1000 battery's reply (captured
+      // on the bus). pysweeper's 10 C3 06 left a PSP-1000 blinking its
+      // low-battery LED and power-cycling.
+      static const uint8_t r[] = {0xA5,0x05,0x06,0x00,0xC3,0x05,0x87};
       sendRaw(r, sizeof(r));
       break;
     }
@@ -735,7 +780,10 @@ void handleOpcode(uint8_t opcode, const uint8_t* mesg, int mesgLen) {
       matrixSwap(mixed, swapped);
       aesEcbEncrypt(key, swapped, chall2);
       aesEcbEncrypt(key, chall2, response2);
-      sendPacket("a51206", response2, 16);
+      // PSP-1000 syscons (0x00-0x06) take an 8-byte answer, as a genuine battery
+      // sends; later revisions accept pysweeper's 16-byte form.
+      if (g_version <= 0x06) sendPacket("a50a06", response2, 8);
+      else                   sendPacket("a51206", response2, 16);
       if (g_version == 0xEB || g_version == 0xB3) {
         static const uint8_t nudge[] = {0x5A,0x02,0x01,0xA2};
         sendRaw(nudge, sizeof(nudge));
@@ -832,7 +880,9 @@ void handleOpcode(uint8_t opcode, const uint8_t* mesg, int mesgLen) {
 
 void setup() {
   // USB CDC serial for debug output to your PC (115200 baud, no framing config needed)
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);   // never block on USB; see flushLog()
   delay(1000);   // give the USB CDC connection time to enumerate before we print
   Serial.println("============================================");
   Serial.println("  BaryonSweeper  ESP32-C3  [v3 FIXED]");
@@ -860,6 +910,11 @@ void setup() {
    * bit is transparent to us — it looks like idle bus time between frames.
    */
   Serial1.begin(19200, SERIAL_8E1, PSP_RX_PIN, PSP_TX_PIN);
+
+  // Open-drain TX: GPIO4 can only pull the DATA line low; the 10k pull-up
+  // provides the high level. Replaces the series diode — wire GPIO4 directly
+  // to GPIO5/DATA. Must come after Serial1.begin(), which configures the pin.
+  gpio_od_enable((gpio_num_t)PSP_TX_PIN);
 
   // Flush any bytes the PSP may have sent before our UART was initialised.
   // This typically happens if the PSP was already powered on when we booted.
@@ -907,4 +962,6 @@ void loop() {
   }
 
   handleOpcode(opcode, mesg, mesgLen);
+  g_log += g_rxLog + "\n" + g_txLog;
+  g_txLog = "";
 }

@@ -2,6 +2,12 @@
 ### A PSP Baryon Sweeper port for ESP32 — easier, more accessible PSP unbricking
 *Original Baryon Sweeper by khubik2 — ESP32 port guide*
 
+> **Fork note (PSP-1000 / ESP32-C3):** this fork fixes battery authentication for
+> PSP-1000 syscons (key versions `0x00`–`0x06`), replaces the diode with an
+> open-drain TX, and reworks reply timing. See
+> [docs/PSP-1001-debugging.md](docs/PSP-1001-debugging.md) for what was found,
+> how, and what is still open.
+
 ---
 
 ## What is this?
